@@ -4,7 +4,7 @@
 The input of the model is flattened to a 1D tensor of tokens. The model uses
 InputMetadata to extract the original 2D shape of the input.
 """
-
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -14,30 +14,56 @@ from transformers import LlamaConfig
 
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.attention import PagedAttentionWithALiBi
-from vllm.model_executor.layers.quantized_linear import ParallelLinear
+from vllm.model_executor.layers.attention import PagedAttention
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               LinearMethodBase,
+                                               RowParallelLinear)
 from vllm.model_executor.layers.sampler import Sampler
-from vllm.model_executor.models.bloom import _get_alibi_slopes
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding)
 from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
-from vllm.model_executor.parallel_utils.layers import VocabParallelEmbedding
-from vllm.model_executor.quantization_utils import QuantizationConfig
-from vllm.model_executor.weight_utils import (
-    convert_pyslice_to_tensor, hf_model_weights_iterator,
-    load_tensor_parallel_weights)
+    get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank)
+from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator, convert_pyslice_to_tensor)
 from vllm.sequence import SamplerOutput
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
+def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
+    closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
+    base = torch.tensor(
+        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
+        dtype=torch.float32,
+    )
+    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32)
+    slopes = torch.pow(base, powers)
+
+    if closest_power_of_2 != total_num_heads:
+        extra_base = torch.tensor(
+            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
+            dtype=torch.float32,
+        )
+        num_remaining_heads = min(closest_power_of_2,
+                                  total_num_heads - closest_power_of_2)
+        extra_powers = torch.arange(start=1,
+                                    end=1 + 2 * num_remaining_heads,
+                                    step=2,
+                                    dtype=torch.int32)
+        slopes = torch.cat(
+            [slopes, torch.pow(extra_base, extra_powers)], dim=0)
+    return slopes
+
+
 class LayerNormWithoutBias(nn.LayerNorm):
 
     def __init__(
-        self,
-        normalized_shape,
-        eps: float = 1e-5,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None
+            self,
+            normalized_shape,
+            eps: float = 1e-5,
+            device: Optional[torch.device] = None,
+            dtype: Optional[torch.dtype] = None
     ) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__(normalized_shape, eps, elementwise_affine=True, **factory_kwargs)
@@ -50,25 +76,27 @@ class LayerNormWithoutBias(nn.LayerNorm):
 class RefactMLP(nn.Module):
 
     def __init__(
-        self,
-        hidden_size: int,
-        mult: float,
-        quant_config: Optional[QuantizationConfig] = None
+            self,
+            hidden_size: int,
+            mult: float,
+            linear_method: Optional[LinearMethodBase] = None,
     ):
         super().__init__()
         multiple_of = 256
         intermediate_size = int(2 * (hidden_size * mult) / 3)
         self.intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
-        self.gate_up_proj = ParallelLinear.column(hidden_size,
-                                                  2 * self.intermediate_size,
-                                                  bias=False,
-                                                  gather_output=False,
-                                                  quant_config=quant_config)
-        self.c_proj = ParallelLinear.row(self.intermediate_size,
-                                         hidden_size,
-                                         bias=False,
-                                         input_is_parallel=True,
-                                         quant_config=quant_config)
+        self.gate_up_proj = ColumnParallelLinear(
+            hidden_size,
+            2 * self.intermediate_size,
+            bias=False,
+            linear_method=linear_method
+        )
+        self.c_proj = RowParallelLinear(
+            self.intermediate_size,
+            hidden_size,
+            bias=False,
+            linear_method=linear_method
+        )
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -81,68 +109,65 @@ class RefactMLP(nn.Module):
 class RefactAttention(nn.Module):
 
     def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        quant_config: Optional[QuantizationConfig] = None
+            self,
+            hidden_size: int,
+            num_heads: int,
+            linear_method: Optional[LinearMethodBase] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
         self.total_num_heads = num_heads
-        self.num_heads = self.total_num_heads // tp_size
-        assert self.num_heads % tp_size == 0
-        self.num_kv_heads = 1
+        self.tensor_model_parallel_world_size = (
+            get_tensor_model_parallel_world_size())
+        tp_rank = get_tensor_model_parallel_rank()
+        self.num_heads = (self.total_num_heads //
+                          self.tensor_model_parallel_world_size)
+        assert self.num_heads % self.tensor_model_parallel_world_size == 0
         self.head_dim = hidden_size // self.total_num_heads
-        self.kv_dim = self.head_dim
         self.scaling = self.head_dim ** -0.5
-        self.q = ParallelLinear.column(
+        self.num_kv_heads = 1
+        self.kv_dim = self.head_dim
+        self.q = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size,
             bias=False,
             gather_output=False,
-            quant_config=quant_config,
+            linear_method=linear_method,
         )
         self.kv = nn.Linear(
             self.hidden_size,
             2 * self.kv_dim,
             bias=False
         )
-        self.c_proj = ParallelLinear.row(
+        self.c_proj = RowParallelLinear(
             self.hidden_size,
             self.hidden_size,
             bias=False,
             input_is_parallel=True,
-            quant_config=quant_config,
+            linear_method=linear_method,
         )
         head_start = tp_rank * self.num_heads
         head_end = (tp_rank + 1) * self.num_heads
         alibi_slopes = _get_alibi_slopes(self.num_heads)
         alibi_slopes = alibi_slopes[head_start:head_end].tolist()
-        self.sa = PagedAttentionWithALiBi(
+        self.sa = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
-            slopes=alibi_slopes,
+            alibi_slopes=alibi_slopes,
             num_kv_heads=self.num_kv_heads
         )
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
-        cache_event: Optional[torch.cuda.Event],
+            self,
+            hidden_states: torch.Tensor,
+            kv_cache: KVCache,
+            input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        del positions  # unused.
         q, _ = self.q(hidden_states)
         k, v = self.kv(hidden_states).split([self.kv_dim, self.kv_dim], dim=-1)
         k_cache, v_cache = kv_cache
-        attn_output = self.sa(q, k, v,
-                              k_cache, v_cache,
-                              input_metadata, cache_event)
+        attn_output = self.sa(q, k, v, k_cache, v_cache, input_metadata)
         output, _ = self.c_proj(attn_output)
         return output
 
@@ -150,21 +175,21 @@ class RefactAttention(nn.Module):
 class RefactDecoderLayer(nn.Module):
 
     def __init__(
-        self,
-        config: LlamaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+            self,
+            config: LlamaConfig,
+            linear_method: Optional[LinearMethodBase] = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.attn = RefactAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            quant_config=quant_config,
+            linear_method=linear_method,
         )
         self.mlp = RefactMLP(
             hidden_size=self.hidden_size,
             mult=4.0,
-            quant_config=quant_config,
+            linear_method=linear_method,
         )
         self.ln_1 = LayerNormWithoutBias(
             self.hidden_size,
@@ -176,22 +201,17 @@ class RefactDecoderLayer(nn.Module):
         )
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
-        cache_event: Optional[torch.cuda.Event],
+            self,
+            hidden_states: torch.Tensor,
+            kv_cache: KVCache,
+            input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        # Self Attention
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         hidden_states = self.attn(
-            positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             input_metadata=input_metadata,
-            cache_event=cache_event,
         )
         hidden_states = residual + hidden_states
 
@@ -206,9 +226,9 @@ class RefactDecoderLayer(nn.Module):
 class RefactModel(nn.Module):
 
     def __init__(
-        self,
-        config: LlamaConfig,
-        quant_config: Optional[QuantizationConfig] = None
+            self,
+            config: LlamaConfig,
+            linear_method: Optional[LinearMethodBase] = None,
     ):
         super().__init__()
         self.config = config
@@ -216,36 +236,26 @@ class RefactModel(nn.Module):
         self.vocab_size = config.vocab_size
 
         vocab_size = ((config.vocab_size + 63) // 64) * 64
-        self.wte = VocabParallelEmbedding(
-            vocab_size,
-            config.hidden_size
-        )
+        self.wte = VocabParallelEmbedding(vocab_size, config.hidden_size)
         self.h = nn.ModuleList([
-            RefactDecoderLayer(config, quant_config)
+            RefactDecoderLayer(config, linear_method)
             for _ in range(config.num_hidden_layers)
         ])
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
-        cache_events: Optional[List[torch.cuda.Event]],
+            self,
+            input_ids: torch.Tensor,
+            position_ids: torch.Tensor,
+            kv_caches: List[KVCache],
+            input_metadata: InputMetadata,
     ) -> torch.Tensor:
         hidden_states = self.wte(input_ids)
         for i in range(len(self.h)):
-            if cache_events is None:
-                cache_event = None
-            else:
-                cache_event = cache_events[i]
             layer = self.h[i]
             hidden_states = layer(
-                positions,
                 hidden_states,
                 kv_caches[i],
                 input_metadata,
-                cache_event,
             )
         return hidden_states
 
@@ -253,44 +263,40 @@ class RefactModel(nn.Module):
 class GPTRefactForCausalLM(nn.Module):
 
     def __init__(
-        self,
-        config: LlamaConfig,
-        quant_config: Optional[QuantizationConfig] = None
+            self,
+            config: LlamaConfig,
+            linear_method: Optional[LinearMethodBase] = None,
     ):
         super().__init__()
         self.config = config
-        self.transformer = RefactModel(config, quant_config)
+        self.transformer = RefactModel(config, linear_method)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         self.ln_f = LayerNormWithoutBias(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.lm_head = ParallelLinear.column(config.hidden_size,
-                                             vocab_size,
-                                             bias=False,
-                                             gather_output=False,
-                                             quant_config=None)
+        self.lm_head = ColumnParallelLinear(config.hidden_size,
+                                            vocab_size,
+                                            bias=False,
+                                            linear_method=linear_method)
         self.sampler = Sampler(config.vocab_size)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
-        cache_events: Optional[List[torch.cuda.Event]],
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            kv_caches: List[KVCache],
+            input_metadata: InputMetadata,
     ) -> SamplerOutput:
         hidden_states = self.transformer(input_ids, positions, kv_caches,
-                                         input_metadata, cache_events)
-        hidden_states = self.ln_f(hidden_states)
-        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
-                                   input_metadata)
-        return next_tokens
+                                         input_metadata)
+        return self.ln_f(hidden_states)
 
-    _column_parallel_weights = [
-        "wte.weight", "lm_head.weight",
-        "q.weight", "gate_up_proj.weight"
-    ]
-    _row_parallel_weights = [
-        "attn.c_proj.weight", "mlp.c_proj.weight"
-    ]
+    def sample(
+            self,
+            hidden_states: torch.Tensor,
+            sampling_metadata: SamplingMetadata,
+    ) -> Optional[SamplerOutput]:
+        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
+                                   sampling_metadata)
+        return next_tokens
 
     def load_weights(self,
                      model_name_or_path: str,
@@ -298,7 +304,6 @@ class GPTRefactForCausalLM(nn.Module):
                      load_format: str = "auto",
                      revision: Optional[str] = None):
         tp_size = get_tensor_model_parallel_world_size()
-        tensor_model_parallel_rank = get_tensor_model_parallel_rank()
         state_dict = self.state_dict()
 
         for name, loaded_weight in hf_model_weights_iterator(
@@ -316,7 +321,6 @@ class GPTRefactForCausalLM(nn.Module):
                 loaded_weight = torch.cat([loaded_weight, extra_rows], dim=0)
 
             param = state_dict[name]
-            load_tensor_parallel_weights(param, loaded_weight, name,
-                                         self._column_parallel_weights,
-                                         self._row_parallel_weights,
-                                         tensor_model_parallel_rank)
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(param, loaded_weight)
