@@ -818,10 +818,10 @@ class SamplerWithLoRA(BaseLayerWithLoRA):
         model_config: Optional[PretrainedConfig] = None,
     ) -> None:
         # Keep this in sync with csrc/punica/bgmv/bgmv_config.h
-        if 32000 < self.base_layer.vocab_size > 33024:
-            raise ValueError(
-                "When using LoRA, vocab size must be 32000 >= vocab_size <= 33024"
-            )
+        # if 32000 < self.base_layer.vocab_size > 33024:
+        #     raise ValueError(
+        #         "When using LoRA, vocab size must be 32000 >= vocab_size <= 33024"
+        #     )
         self.lora_a_stacked = torch.zeros(
             (
                 max_loras,

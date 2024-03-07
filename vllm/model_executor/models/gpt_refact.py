@@ -12,15 +12,16 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig
 
+from vllm.config import LoRAConfig
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import PagedAttention
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearMethodBase,
-                                               RowParallelLinear)
+                                               RowParallelLinear, QKVParallelLinear)
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding)
+    VocabParallelEmbedding, ParallelLMHead, DEFAULT_VOCAB_PADDING_SIZE)
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
@@ -127,17 +128,15 @@ class RefactAttention(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.num_kv_heads = 1
         self.kv_dim = self.head_dim
-        self.q = ColumnParallelLinear(
-            self.hidden_size,
-            self.hidden_size,
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.num_kv_heads,
             bias=False,
-            gather_output=False,
             linear_method=linear_method,
-        )
-        self.kv = nn.Linear(
-            self.hidden_size,
-            2 * self.kv_dim,
-            bias=False
         )
         self.c_proj = RowParallelLinear(
             self.hidden_size,
@@ -164,8 +163,8 @@ class RefactAttention(nn.Module):
             kv_cache: KVCache,
             input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        q, _ = self.q(hidden_states)
-        k, v = self.kv(hidden_states).split([self.kv_dim, self.kv_dim], dim=-1)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         k_cache, v_cache = kv_cache
         attn_output = self.sa(q, k, v, k_cache, v_cache, input_metadata)
         output, _ = self.c_proj(attn_output)
@@ -261,21 +260,49 @@ class RefactModel(nn.Module):
 
 
 class GPTRefactForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q",
+            "k",
+            "v",
+        ]
+    }
+
+    supported_lora_modules = [
+        "attn.qkv_proj",
+        "attn.c_proj",
+        "mlp.gate_up_proj",
+        "mlp.c_proj",
+        "wte",
+        "lm_head",
+    ]
+    embedding_modules = {
+        "wte": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+    embedding_padding_modules = ["lm_head"]
 
     def __init__(
             self,
             config: LlamaConfig,
             linear_method: Optional[LinearMethodBase] = None,
+            lora_config: Optional[LoRAConfig] = None,
     ):
         super().__init__()
         self.config = config
         self.transformer = RefactModel(config, linear_method)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         self.ln_f = LayerNormWithoutBias(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.lm_head = ColumnParallelLinear(config.hidden_size,
-                                            vocab_size,
-                                            bias=False,
-                                            linear_method=linear_method)
+        self.lm_head = ParallelLMHead(
+            vocab_size,
+            config.hidden_size,
+            bias=False,
+            org_num_embeddings=vocab_size,
+            padding_size=DEFAULT_VOCAB_PADDING_SIZE
+            # We need bigger padding if using lora for kernel
+            # compatibility
+            if not lora_config else lora_config.lora_vocab_padding_size,
+        )
         self.sampler = Sampler(config.vocab_size)
 
     def forward(
@@ -303,24 +330,31 @@ class GPTRefactForCausalLM(nn.Module):
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto",
                      revision: Optional[str] = None):
-        tp_size = get_tensor_model_parallel_world_size()
-        state_dict = self.state_dict()
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q", "q"),
+            ("qkv_proj", "kv", "k"),
+            ("qkv_proj", "kv", "v"),
+        ]
 
+        params_dict = dict(self.named_parameters())
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
-            loaded_weight = convert_pyslice_to_tensor(loaded_weight)
-
-            if "wte.weight" in name or "lm_head" in name:
-                param = state_dict[name]
-                # Consider padding in the vocab size.
-                padded_vocab_size = (param.shape[0] * tp_size)
-                num_extra_rows = padded_vocab_size - self.config.vocab_size
-                extra_rows = torch.empty(num_extra_rows,
-                                         loaded_weight.shape[1])
-                extra_rows = extra_rows.to(loaded_weight)
-                loaded_weight = torch.cat([loaded_weight, extra_rows], dim=0)
-
-            param = state_dict[name]
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
-            weight_loader(param, loaded_weight)
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                if weight_name == "kv":
+                    k_weight, v_weight = loaded_weight.split(loaded_weight.shape[0] // 2)
+                    name = name.replace(weight_name, param_name)
+                    param = params_dict[name]
+                    param.weight_loader(param, k_weight, "k")
+                    param.weight_loader(param, v_weight, "v")
+                else:
+                    name = name.replace(weight_name, param_name)
+                    param = params_dict[name]
+                    param.weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)

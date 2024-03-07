@@ -98,10 +98,11 @@ def initialize_engine() -> LLMEngine:
     #   numbers will cause higher memory usage. If you know that all LoRAs will
     #   use the same rank, it is recommended to set this as low as possible.
     # max_cpu_loras: controls the size of the CPU LoRA cache.
-    engine_args = EngineArgs(model="meta-llama/Llama-2-7b-hf",
+    engine_args = EngineArgs(model="smallcloudai/Refact-1_6B-fim",
                              enable_lora=True,
-                             max_loras=1,
-                             max_lora_rank=8,
+                             trust_remote_code=True,
+                             max_loras=2,
+                             max_lora_rank=64,
                              max_cpu_loras=2,
                              max_num_seqs=256)
     return LLMEngine.from_engine_args(engine_args)
@@ -110,7 +111,7 @@ def initialize_engine() -> LLMEngine:
 def main():
     """Main function that sets up and runs the prompt processing."""
     engine = initialize_engine()
-    lora_path = snapshot_download(repo_id="yard1/llama-2-7b-sql-lora-test")
+    lora_path = "/home/svakhreev/.refact/perm-storage/loras/lora-20240308-014142/checkpoints/test"
     test_prompts = create_test_prompts(lora_path)
     process_requests(engine, test_prompts)
 
